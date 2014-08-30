@@ -51,6 +51,9 @@
 /* Maximum TCK frequency of FT2232H / FT4232H  */
 #define FT2232H_MAX_TCK_FREQ 30000000
 
+/* Maximum TCK frequency of FT2232HQ */
+#define FT2232HQ_MAX_TCK_FREQ 60000000
+
 /* The default driver if not specified otherwise during connect */
 #ifdef ENABLE_LOWLEVEL_FTD2XX
 #define DEFAULT_DRIVER "ftd2xx-mpsse"
@@ -88,6 +91,14 @@
 /* FT2232H / FT4232H only commands */
 #define DISABLE_CLOCKDIV  0x8A /* Disables the clk divide by 5 to allow for a 60MHz master clock */
 #define ENABLE_CLOCKDIV   0x8B /* Enables the clk divide by 5 to allow for backward compatibility with FT2232D */
+
+/* Adaptive clocking */
+#define ENABLE_ADAPTIVE_CLOCK   0x96
+#define DISABLE_ADAPTIVE_CLOCK  0x97
+
+/* 3 phases clock */
+#define ENABLE_3PHASE_CLOCK     0x8c
+#define DISABLE_3PHASE_CLOCK    0x8d
 
 /* bit and bitmask definitions for GPIO commands */
 #define BIT_TCK         0
@@ -241,6 +252,9 @@
 #define BIT_MILKYMIST_VREF 4
 #define BITMASK_MILKYMIST_VREF (1 << BIT_MILKYMIST_VREF)
 
+/* Bit and mask definitions for Analgo Discovery, FT2232H based) */
+#define BIT_ANALOGDISCOVERY_ENABLE_JTAG     7
+#define BITMASK_ANALOGDISCOVERY_ENABLE_JTAG (1 << BIT_ANALOGDISCOVERY_ENABLE_JTAG)
 
 typedef struct
 {
@@ -294,6 +308,26 @@ ft2232h_disable_clockdiv_by5 (urj_cable_t *cable)
 }
 
 static void
+ft2232hq_disable_adaptive_clock (urj_cable_t *cable)
+{
+    params_t *params = cable->params;
+    urj_tap_cable_cx_cmd_root_t *cmd_root = &params->cmd_root;
+
+    urj_tap_cable_cx_cmd_queue( cmd_root, 0 );
+    urj_tap_cable_cx_cmd_push( cmd_root, DISABLE_ADAPTIVE_CLOCK);
+}
+
+static void
+ft2232hq_disable_3phase_clock (urj_cable_t *cable)
+{
+    params_t *params = cable->params;
+    urj_tap_cable_cx_cmd_root_t *cmd_root = &params->cmd_root;
+
+    urj_tap_cable_cx_cmd_queue( cmd_root, 0 );
+    urj_tap_cable_cx_cmd_push( cmd_root, DISABLE_3PHASE_CLOCK);
+}
+
+static void
 ft2232_set_frequency_common (urj_cable_t *cable, uint32_t new_frequency, uint32_t max_frequency)
 {
     params_t *params = cable->params;
@@ -321,6 +355,12 @@ ft2232_set_frequency_common (urj_cable_t *cable, uint32_t new_frequency, uint32_
         if (max_frequency == FT2232H_MAX_TCK_FREQ)
             ft2232h_disable_clockdiv_by5 (cable);
 
+        if (max_frequency == FT2232HQ_MAX_TCK_FREQ) {
+            ft2232h_disable_clockdiv_by5 (cable);
+            ft2232hq_disable_adaptive_clock (cable);
+            ft2232hq_disable_3phase_clock (cable);
+        }
+
         /* send new divisor to device */
         div -= 1;
         urj_tap_cable_cx_cmd_queue (cmd_root, 0);
@@ -347,6 +387,12 @@ static void
 ft2232h_set_frequency (urj_cable_t *cable, uint32_t new_frequency)
 {
     ft2232_set_frequency_common (cable, new_frequency, FT2232H_MAX_TCK_FREQ);
+}
+
+static void
+ft2232hq_set_frequency (urj_cable_t *cable, uint32_t new_frequency)
+{
+    ft2232_set_frequency_common (cable, new_frequency, FT2232HQ_MAX_TCK_FREQ);
 }
 
 static int
@@ -1057,6 +1103,44 @@ ft2232_milkymist_init (urj_cable_t *cable)
     return URJ_STATUS_OK;
 }
 
+static int
+ft2232_analogdiscovery_init (urj_cable_t *cable)
+{
+    params_t *params = cable->params;
+    urj_tap_cable_cx_cmd_root_t *cmd_root = &params->cmd_root;
+
+    if (urj_tap_usbconn_open (cable->link.usb) != URJ_STATUS_OK) {
+        urj_log (URJ_LOG_LEVEL_NORMAL, "Unable to open USB link");
+        return URJ_STATUS_FAIL;
+    }
+
+    // Set frequency to 10 MHz
+    ft2232hq_set_frequency(cable, 10000000);
+
+    // Enable JTAG IO (classic pins used on the ft2232h)
+    params->low_byte_value = 0 | BITMASK_TMS;
+    params->low_byte_dir = 0 | BITMASK_TCK | BITMASK_TDI | BITMASK_TMS;
+
+    urj_tap_cable_cx_cmd_queue (cmd_root, 0);
+    urj_tap_cable_cx_cmd_push (cmd_root, SET_BITS_LOW);
+    urj_tap_cable_cx_cmd_push (cmd_root, params->low_byte_value);
+    urj_tap_cable_cx_cmd_push (cmd_root, params->low_byte_dir);
+
+    // Enable JTAG (0x80 on high byte)
+    params->high_byte_value = 0 | BITMASK_ANALOGDISCOVERY_ENABLE_JTAG;
+    params->high_byte_dir = 0 | BITMASK_ANALOGDISCOVERY_ENABLE_JTAG;
+
+    urj_tap_cable_cx_cmd_push (cmd_root, SET_BITS_HIGH);
+    urj_tap_cable_cx_cmd_push (cmd_root, params->high_byte_value);
+    urj_tap_cable_cx_cmd_push (cmd_root, params->high_byte_dir);
+
+    params->bit_trst = -1; // not used
+    params->bit_reset = -1; // not used
+    params->last_tdo_valid = 0;
+
+    return URJ_STATUS_OK;
+}
+
 static void
 ft2232_generic_done (urj_cable_t *cable)
 {
@@ -1519,6 +1603,28 @@ ft2232_milkymist_done (urj_cable_t *cable)
     urj_tap_cable_cx_xfer (cmd_root, &imm_cmd, cable,
                            URJ_TAP_CABLE_COMPLETELY);
 
+    urj_tap_cable_generic_usbconn_done (cable);
+}
+
+static void
+ft2232_analogdiscovery_done (urj_cable_t *cable)
+{
+    params_t *params = cable->params;
+    urj_tap_cable_cx_cmd_root_t *cmd_root = &params->cmd_root;
+
+    /* Disable JTAG io */
+    urj_tap_cable_cx_cmd_queue (cmd_root, 0);
+    urj_tap_cable_cx_cmd_push (cmd_root, SET_BITS_LOW);
+    urj_tap_cable_cx_cmd_push (cmd_root, 0);
+    urj_tap_cable_cx_cmd_push (cmd_root, 0);
+
+    /* Disable JTAG */
+    urj_tap_cable_cx_cmd_push (cmd_root, SET_BITS_HIGH);
+    urj_tap_cable_cx_cmd_push (cmd_root, 0);
+    urj_tap_cable_cx_cmd_push (cmd_root, 0);
+    urj_tap_cable_cx_xfer (cmd_root, &imm_cmd, cable, URJ_TAP_CABLE_COMPLETELY);
+
+    /* Generic done for USB */
     urj_tap_cable_generic_usbconn_done (cable);
 }
 
@@ -2554,6 +2660,26 @@ const urj_cable_driver_t urj_tap_cable_ft2232_milkymist_driver = {
     ftdx_usbcable_help
 };
 URJ_DECLARE_FTDX_CABLE(0x20b7, 0x0713, "-mpsse", "milkymist", milkymist)
+
+const urj_cable_driver_t urj_tap_cable_ft2232_analogdiscovery_driver = {
+    "analogdiscovery",
+    N_("Analog Discovery by Digilent"),
+    URJ_CABLE_DEVICE_USB,
+    { .usb = ft2232_connect, },
+    urj_tap_cable_generic_disconnect,
+    ft2232_cable_free,
+    ft2232_analogdiscovery_init,
+    ft2232_analogdiscovery_done,
+    ft2232hq_set_frequency,
+    ft2232_clock,
+    ft2232_get_tdo,
+    ft2232_transfer,
+    ft2232_set_signal,
+    urj_tap_cable_generic_get_signal,
+    ft2232_flush,
+    ftdx_usbcable_help
+};
+URJ_DECLARE_FTDX_CABLE(0x0403, 0x6014, "-mpsse", "analogdiscovery", analogdiscovery)
 
 /*
  Local Variables:
